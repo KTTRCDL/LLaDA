@@ -56,6 +56,16 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         mask_id: The toke id of [MASK] is 126336.
         logits_eos_inf: Whether to set the logits of EOS token to -inf. See Appendix B.4 of LLaDA for details
         confidence_eos_eot_inf: Whether to set the confidence of EOS and EoT token to -inf. See Appendix B.4 of LLaDA for details
+
+    [FC-IDD] This is the PRIMARY INTEGRATION POINT for Factual-Constrained Iterative
+    Denoising Diffusion. Four hooks must be added inside the inner step loop below;
+    each is marked with "# [FC-IDD:<role>]". See FC-IDD-analysis/README.md for the
+    full walkthrough and red-team-driven upgrade notes.
+    Four hook roles:
+      A. gradient-guidance  -> add lambda_F * d R_phi / d logits to `logits`
+      B. score-then-sample  -> O_F entailment on decoded spans (after x0 is committed)
+      C. factual remask     -> flip committed tokens back to mask_id if R_phi < tau_F
+      D. constraint-project -> project x0 onto C = {x : R_phi(x) >= tau_F}
     '''
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -91,6 +101,13 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
             if logits_eos_inf:
                 logits[:, :, 126081] = -torch.inf
 
+            # [FC-IDD:A gradient-guidance] Insert factual guidance here, in LOGIT space,
+            # BEFORE gumbel-noise + argmax. Red-team #2: do NOT take a gradient w.r.t.
+            # discrete token ids. Instead, treat `logits` as continuous and add
+            # lambda_F * d R_phi(softmax(logits)) / d logits, where R_phi is a learned
+            # differentiable factuality surrogate (trained from O_F via DPO/on-policy).
+            #   logits = logits + lambda_F * fc_idd_guidance_grad(logits, x, mask_index)
+
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
             
@@ -116,6 +133,26 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                 _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
                 transfer_index[j, select_index] = True
             x[transfer_index] = x0[transfer_index]
+
+            # [FC-IDD:B score-then-sample + C factual remask + D constraint-project]
+            # At this point `x` contains the newly committed tokens for step i.
+            # In stock LLaDA these tokens are PERMANENT (the outer mask_index is
+            # recomputed from `x` next iter and will not include them -- this is
+            # the "immutability defect" FC-IDD calls out).
+            # The FC-IDD revision loop should:
+            #   1) Extract fully-decoded contiguous spans in x[:, prompt.shape[1]:]
+            #      (abstain on short / still-masked regions; red-team #4).
+            #   2) Run O_F(retrieval, span) -> factual score; only invoke on a log
+            #      schedule of steps (red-team #1) and cache retrieval by claim skel.
+            #   3) If score < tau_F: locate the error token(s) and reset those
+            #      positions in `x` back to mask_id, so the next iter's
+            #      mask_index = (x == mask_id) picks them up for re-denoising.
+            #   4) Optional constraint-projection P_C: run a Lagrangian-dual
+            #      solve on x_hat_0 (the predicted clean sample) to project it
+            #      onto {x : R_phi(x) >= tau_F}. Red-team #3: likely redundant
+            #      with (A) guidance; start WITHOUT (D) and ablate.
+            # Reference impl skeleton lives at
+            # FC-IDD-analysis/README.md  (section "LLaDA patch skeleton").
 
     return x
 
